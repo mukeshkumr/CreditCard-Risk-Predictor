@@ -1,13 +1,19 @@
 import json
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+
 import joblib
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
+from artifact_loader import ensure_artifacts
+
+BASE_DIR = Path(__file__).resolve().parent
 
 # ============================================================
 # MODEL STORAGE
@@ -17,11 +23,16 @@ ml_model = {}
 
 
 # ============================================================
-# LOAD MODELS
+# LOAD MODEL ARTIFACTS AND MODELS
 # ============================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
+    print("Preparing model artifacts...")
+
+    # Download missing artifacts from Hugging Face first.
+    artifacts_dir = ensure_artifacts()
 
     print("Loading ML models...")
 
@@ -32,13 +43,15 @@ async def lifespan(app: FastAPI):
     preprocessors = []
 
     for i in range(5):
-
-        path = f"artifacts/preprocessors/preprocessor_{i}.pkl"
+        path = (
+            artifacts_dir
+            / "preprocessors"
+            / f"preprocessor_{i}.pkl"
+        )
 
         print(f"Loading preprocessor {i}...")
 
         preprocessor = joblib.load(path)
-
         preprocessors.append(preprocessor)
 
     # --------------------------------------------------------
@@ -48,38 +61,66 @@ async def lifespan(app: FastAPI):
     xgb_models = []
 
     for i in range(5):
-
-        path = f"artifacts/native_models/xgb_model_{i}.ubj"
+        path = (
+            artifacts_dir
+            / "native_models"
+            / f"xgb_model_{i}.ubj"
+        )
 
         print(f"Loading XGBoost model {i}...")
 
         model = xgb.XGBClassifier()
-
-        model.load_model(path)
+        model.load_model(str(path))
 
         xgb_models.append(model)
 
     # --------------------------------------------------------
-    # Load calibration parameters
+    # Load sigmoid calibration parameters
     # --------------------------------------------------------
 
-    with open("artifacts/calibration.json", "r") as f:
+    calibration_path = artifacts_dir / "calibration.json"
+
+    with calibration_path.open("r", encoding="utf-8") as f:
         calibration_params = json.load(f)
+
+    if len(calibration_params) != 5:
+        raise ValueError(
+            "Expected calibration parameters for all 5 models."
+        )
 
     print("Calibration parameters loaded.")
 
     # --------------------------------------------------------
-    # Load threshold
+    # Load and validate the decision threshold
     # --------------------------------------------------------
 
-    threshold = joblib.load(
-        "artifacts/best_threshold.pkl"
+    threshold_path = artifacts_dir / "best_threshold.pkl"
+    saved_threshold = joblib.load(threshold_path)
+    artifact_threshold = float(np.asarray(saved_threshold).item())
+
+    # Allow an explicit override for testing or deployment.
+    override = os.getenv("DECISION_THRESHOLD")
+
+    threshold = (
+        float(override)
+        if override is not None
+        else artifact_threshold
     )
 
-    print("Threshold:", threshold)
+    # A threshold of 1.0 is almost never useful for this
+    # risk-classification setup. Fail clearly instead of
+    # silently classifying a 95.2% probability as Low Risk.
+    if not 0.0 < threshold < 1.0:
+        raise ValueError(
+            f"Invalid decision threshold: {threshold}. "
+            "Set DECISION_THRESHOLD to a validated value "
+            "between 0 and 1, or fix best_threshold.pkl."
+        )
+
+    print(f"Decision threshold: {threshold:.4f}")
 
     # --------------------------------------------------------
-    # Store everything
+    # Store everything for prediction requests
     # --------------------------------------------------------
 
     ml_model["preprocessors"] = preprocessors
@@ -106,7 +147,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Credit Card Risk Predictor",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 
@@ -115,27 +156,16 @@ app = FastAPI(
 # ============================================================
 
 class LoanApplication(BaseModel):
-
     person_age: int
-
     person_income: float
-
     person_home_ownership: str
-
     person_emp_length: float
-
     loan_intent: str
-
     loan_grade: str
-
     loan_amnt: float
-
     loan_int_rate: float
-
     loan_percent_income: float
-
     cb_person_default_on_file: str
-
     cb_person_cred_hist_length: int
 
 
@@ -144,17 +174,14 @@ class LoanApplication(BaseModel):
 # ============================================================
 
 def sigmoid_calibration(probability, a, b):
-
     """
-    Same sigmoid calibration used by
+    Apply the same sigmoid calibration used by
     sklearn's _SigmoidCalibration.
 
     p = sigmoid(-(a * probability + b))
     """
 
     value = -(a * probability + b)
-
-    # Prevent overflow in exp()
     value = np.clip(value, -500, 500)
 
     return 1.0 / (1.0 + np.exp(-value))
@@ -167,80 +194,54 @@ def sigmoid_calibration(probability, a, b):
 @app.post("/predict")
 def predict(data: LoanApplication):
 
-    # --------------------------------------------------------
-    # Convert input into DataFrame
-    # --------------------------------------------------------
-
     input_df = pd.DataFrame([data.model_dump()])
 
     calibrated_probabilities = []
 
-    # --------------------------------------------------------
-    # Run all 5 models
-    # --------------------------------------------------------
-
+    # Run all 5 models, preserving the existing pipeline.
     for i in range(5):
 
         preprocessor = ml_model["preprocessors"][i]
-
         xgb_model = ml_model["xgb_models"][i]
-
         calibration = ml_model["calibration"][i]
 
-        # ----------------------------------------------------
         # Preprocessing
-        # ----------------------------------------------------
-
         transformed_data = preprocessor.transform(input_df)
 
-        # ----------------------------------------------------
-        # XGBoost prediction
-        # ----------------------------------------------------
-
+        # Raw XGBoost probability
         raw_probability = xgb_model.predict_proba(
             transformed_data
         )[0, 1]
 
-        # ----------------------------------------------------
         # Sigmoid calibration
-        # ----------------------------------------------------
-
         a = calibration["a"]
         b = calibration["b"]
 
         calibrated_probability = sigmoid_calibration(
             raw_probability,
             a,
-            b
+            b,
         )
 
         calibrated_probabilities.append(
             calibrated_probability
         )
 
-    # --------------------------------------------------------
-    # Average predictions from 5 calibrated classifiers
-    # --------------------------------------------------------
-
+    # Average the five calibrated probabilities.
     probability = float(
         np.mean(calibrated_probabilities)
     )
 
-    threshold = 0.5  # Default threshold
+    # Use the threshold loaded from Hugging Face artifacts.
+    threshold = ml_model["threshold"]
 
-    prediction = int(
-        probability >= threshold
-    )
-
-    # --------------------------------------------------------
-    # Final response
-    # --------------------------------------------------------
+    prediction = int(probability >= threshold)
 
     return {
         "default_probability": probability,
         "default_prediction": prediction,
         "threshold": threshold,
-        "Result": "High Risk" if prediction == 1 else "Low Risk"
+        "Result": "High Risk" if prediction == 1 else "Low Risk",
     }
 
 
@@ -251,8 +252,8 @@ def predict(data: LoanApplication):
 app.mount(
     "/",
     StaticFiles(
-        directory="static",
-        html=True
+        directory=str(BASE_DIR / "static"),
+        html=True,
     ),
-    name="static"
+    name="static",
 )
