@@ -2,7 +2,16 @@
 
 # 🏦 Credit Card Risk Predictor
 
-**An end-to-end machine learning system for consumer loan default prediction**
+
+<p align="center">
+  <a href="https://creditcard-risk-predictor.onrender.com/">
+    <img src="https://img.shields.io/badge/Live%20Demo-Visit%20Credit%20Card%20Fraud%20Prediction-1a472a?style=for-the-badge" alt="Live Demo - Visit Credit Card Fraud Prediction" />
+  </a>
+</p>
+
+---
+
+*An end-to-end machine learning system for consumer loan default prediction*
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115.0-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
@@ -13,7 +22,9 @@
 
 *Production-grade loan risk assessment powered by an ensemble of calibrated XGBoost classifiers with a sleek, browser-based underwriting desk.*
 
+
 </div>
+
 
 ---
 
